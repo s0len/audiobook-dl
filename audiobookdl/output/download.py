@@ -1,9 +1,11 @@
 from audiobookdl import AudiobookFile, Source, logging, Audiobook
-from audiobookdl.exceptions import UserNotAuthorized, NoFilesFound, DownloadError
+from audiobookdl.exceptions import UserNotAuthorized, NoFilesFound, DownloadError, RequestError
 from . import metadata, output, encryption
 
 import os
 import shutil
+import time
+import requests
 from functools import partial
 from typing import Any, Iterable, List, Optional, Sequence, Tuple, Union
 from rich.progress import Progress, BarColumn, ProgressColumn, SpinnerColumn
@@ -183,41 +185,43 @@ def download_file(args: Tuple[Audiobook, str, int, Any]) -> str:
     file = audiobook.files[index]
     filepath, filepath_tmp = create_filepath(audiobook, output_dir, index)
     logging.debug(f"Starting downloading file: {file.url}")
-    request = audiobook.session.get(file.url, headers=file.headers, stream=True)
-    content_type: Optional[str] =  request.headers.get("Content-type", None)
-
-    expected = file.expected_content_type
-    if isinstance(expected, (list, tuple, set)):
-        invalid_content_type = content_type not in expected
-    else:
-        invalid_content_type = expected and expected != content_type
-    invalid_status_code = file.expected_status_code and file.expected_status_code != request.status_code
-    if invalid_content_type or invalid_status_code:
-        # Failed-download bodies can be raw audio bytes: truncate + escape before rich print
-        from rich.markup import escape as _escape
-        raw_body = request.content[:512]
+    # Retry transient network/TLS failures; after the last attempt raise so the run can skip the book
+    for attempt in range(1, 5):
         try:
-            body_text = raw_body.decode("utf-8")
-        except UnicodeDecodeError:
-            body_text = repr(raw_body)
-        safe_body = _escape(body_text)
-        raise DownloadError(
-            status_code=request.status_code,
-            content_type=content_type,
-            expected_status_code=file.expected_status_code,
-            expected_content_type=file.expected_content_type,
-            body = safe_body,
-            url = file.url
-        )
-
-    total_filesize = int(request.headers["Content-length"])
-
-    # Download file to tmp file
-    with open(filepath_tmp, "wb") as f:
-        for chunk in request.iter_content(chunk_size=1024):
-            f.write(chunk)
-            download_progress = len(chunk) / total_filesize
-            update_progress(download_progress)
+            request = audiobook.session.get(file.url, headers=file.headers, stream=True)
+            content_type: Optional[str] = request.headers.get("Content-type", None)
+            expected = file.expected_content_type
+            if isinstance(expected, (list, tuple, set)):
+                invalid_content_type = content_type not in expected
+            else:
+                invalid_content_type = expected and expected != content_type
+            invalid_status_code = file.expected_status_code and file.expected_status_code != request.status_code
+            if invalid_content_type or invalid_status_code:
+                from rich.markup import escape as _escape
+                raw_body = request.content[:512]
+                try:
+                    body_text = raw_body.decode("utf-8")
+                except UnicodeDecodeError:
+                    body_text = repr(raw_body)
+                raise DownloadError(
+                    status_code=request.status_code,
+                    content_type=content_type,
+                    expected_status_code=file.expected_status_code,
+                    expected_content_type=file.expected_content_type,
+                    body=_escape(body_text),
+                    url=file.url
+                )
+            total_filesize = int(request.headers["Content-length"])
+            with open(filepath_tmp, "wb") as f:
+                for chunk in request.iter_content(chunk_size=1024):
+                    f.write(chunk)
+                    update_progress(len(chunk) / total_filesize)
+            break
+        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout, requests.exceptions.ChunkedEncodingError) as e:
+            if attempt == 4:
+                raise RequestError from e
+            time.sleep(min(2 ** attempt, 10))
     # Decrypt file if necessary
     if file.encryption_method:
         encryption.decrypt_file(filepath_tmp, file.encryption_method)
