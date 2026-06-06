@@ -33,19 +33,24 @@ def combine_audiofiles(filepaths: Sequence[str], tmp_dir: str, output_path: str)
     output_extension = get_extension(output_path)
     tmp_input = os.path.join(tmp_dir, f"input_file.{output_extension}")
     tmp_output = os.path.join(tmp_dir, f"output_file.{output_extension}")
+    in_name = os.path.basename(tmp_input)
+    out_name = os.path.basename(tmp_output)
     shutil.move(filepaths[0], tmp_input)
     for i in range(1, len(filepaths), COMBINE_CHUNK_SIZE):
-        inputs = "|".join(filepaths[i:i+COMBINE_CHUNK_SIZE])
-        concat_input = f"concat:{tmp_input}|{inputs}"
+        # Run from tmp_dir with basenames: ffmpeg's concat: protocol reads a ':' in a path
+        # as a protocol prefix, so absolute paths break on titles like "24: Den hemliga...".
+        chunk = "|".join(os.path.basename(p) for p in filepaths[i:i+COMBINE_CHUNK_SIZE])
+        concat_input = f"concat:{in_name}|{chunk}"
         result = subprocess.run(
             [
                 "ffmpeg", "-y",
                 "-i", concat_input,
                 "-safe", "0",
                 "-codec", "copy",
-                tmp_output
+                out_name
             ],
             capture_output=not logging.ffmpeg_output,
+            cwd=tmp_dir,
         )
         # Re-encode when stream copy fails: some AAC variants trip aac_adtstoasc on copy into MP4
         produced_output = os.path.exists(tmp_output) and os.path.getsize(tmp_output) > 0
@@ -60,9 +65,10 @@ def combine_audiofiles(filepaths: Sequence[str], tmp_dir: str, output_path: str)
                     "-safe", "0",
                     "-c:a", "aac",
                     "-b:a", "128k",
-                    tmp_output
+                    out_name
                 ],
                 capture_output=not logging.ffmpeg_output,
+                cwd=tmp_dir,
             )
         os.remove(tmp_input)
         shutil.move(tmp_output, tmp_input)
